@@ -500,7 +500,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 # 병원 조회 버튼
 col_search, col_refresh = st.columns([3, 1])
 with col_search:
-    if st.button("🚨 근처 응급 병동 탐색 시작", type="primary", use_container_width=True, key="search_hospitals"):
+    if st.button("🚨 증상에 따른 병상 현황 탐색", type="primary", use_container_width=True, key="search_hospitals"):
         st.session_state.show_results = True
         st.session_state.reroll_count += 1
         st.session_state.hospital_approval_status = {}  # 승인 상태 초기화
@@ -712,7 +712,7 @@ if st.session_state.show_results:
         if hpid not in current_hpids_in_stack:
             st.session_state.hospital_stack.append(row.to_dict())
     
-    st.subheader("🏆 병원 입실 요청 현황")
+    st.subheader("🏆 응급실 입실 요청 현황")
     st.caption(f"총 {len(st.session_state.hospital_stack)}곳에 요청 | 거절: {len(st.session_state.rejected_hospitals)}곳")
     
     # 스택에 있는 모든 병원 표시 (최신순)
@@ -874,7 +874,7 @@ if st.session_state.show_results:
                                 margin-top: 0.5rem;
                                 box-shadow: 0 2px 4px rgba(234,88,12,0.3);
                             " onmouseover="this.style.background='#c2410c'" onmouseout="this.style.background='#ea580c'">
-                                📱 당직의 직통: 있음
+                                📱 당직의 전화번호: 있음
                             </button>
                         </a>
                         """, unsafe_allow_html=True)
