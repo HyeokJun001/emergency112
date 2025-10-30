@@ -924,99 +924,83 @@ if st.session_state.show_results:
             
             # 병원 승인 상태 표시 (우측 컬럼)
             with col_approval:
-                # Pending 상태 처리 (스택에서는 현재 top3에 있는 병원만 Pending 표시)
+                # Pending 상태 처리 - 전화하기 버튼 표시
                 in_current_top3 = hospital_id in [r.get("hpid") for _, r in top3.iterrows()] if 'top3' in locals() else False
                 
-                if st.session_state.pending_approval and hospital_id not in st.session_state.hospital_approval_status and in_current_top3:
-                    # Pending 상태 표시
+                # 통화 중 상태 체크
+                calling_status = st.session_state.hospital_approval_status.get(hospital_id)
+                
+                if calling_status == "calling":
+                    # 통화 중 - 승낙/거절 버튼 표시
                     st.markdown("""
                     <div style="background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); 
                                 color: white; 
-                                padding: 2rem 1rem; 
+                                padding: 1rem; 
                                 border-radius: 10px; 
                                 text-align: center;
-                                animation: pulse 1.5s infinite;
-                                height: 100%;">
-                        <h3 style="margin: 0; font-size: 1.3rem;">⏳ 승인 대기중</h3>
-                        <p style="margin: 0.5rem 0 0 0; font-size: 0.9rem;">Pending...</p>
+                                margin-bottom: 0.5rem;">
+                        <h3 style="margin: 0; font-size: 1.2rem;">📞 통화중</h3>
+                        <p style="margin: 0.3rem 0 0 0; font-size: 0.85rem;">통화 후 결과 입력</p>
                     </div>
-                    <style>
-                    @keyframes pulse {
-                        0%, 100% { opacity: 1; }
-                        50% { opacity: 0.7; }
-                    }
-                    </style>
                     """, unsafe_allow_html=True)
                     
-                    # 3초 후 자동 승인 처리 (스택에서 가장 최근 병원일 때만 한 번 실행)
-                    if stack_idx == len(st.session_state.hospital_stack):  # 가장 최근 병원일 때만
-                        import time
-                        time.sleep(3)
-                        
-                        # 모든 병원의 승인 상태 결정
-                        rejected_count = 0
-                        for _, h_row in top3.iterrows():
-                            h_id = h_row.get("hpid")
-                            h_name = h_row.get("dutyName")
-                            h_meets = h_row.get("_meets_conditions", False)
+                    col_accept, col_reject = st.columns(2)
+                    with col_accept:
+                        if st.button("✅ 승낙", key=f"accept_{hospital_id}", use_container_width=True, type="primary"):
+                            st.session_state.hospital_approval_status[hospital_id] = "approved"
+                            # 승인된 병원 정보 저장
+                            st.session_state.approved_hospital = {
+                                "name": row.get("dutyName"),
+                                "lat": row.get("wgs84Lat"),
+                                "lon": row.get("wgs84Lon"),
+                                "addr": row.get("dutyAddr"),
+                                "tel": row.get("dutytel3")
+                            }
+                            st.session_state.pending_approval = False
+                            st.rerun()
+                    
+                    with col_reject:
+                        if st.button("❌ 거절", key=f"reject_{hospital_id}", use_container_width=True):
+                            st.session_state.hospital_approval_status[hospital_id] = "rejected"
+                            st.session_state.rejected_hospitals.add(hospital_id)
+                            st.session_state.rejection_log.append(f"❌ {row.get('dutyName')} - 전화 거절 (통화 불가)")
                             
-                            # 스토리라인: 1,2차는 모두 거절, 3차부터 승낙
-                            if st.session_state.reroll_count <= 2:
-                                st.session_state.hospital_approval_status[h_id] = "rejected"
-                                st.session_state.rejected_hospitals.add(h_id)
-                                rejected_count += 1
-                                # 로그에 기록
-                                st.session_state.rejection_log.append(f"❌ {h_name} - 승인 거절 (조회 {st.session_state.reroll_count}회차)")
-                            else:
-                                # 3차부터는 조건 만족 병원만 승낙
-                                if h_meets:
-                                    st.session_state.hospital_approval_status[h_id] = "approved"
-                                    # 승인된 병원 정보 저장
-                                    st.session_state.approved_hospital = {
-                                        "name": h_name,
-                                        "lat": h_row.get("wgs84Lat"),
-                                        "lon": h_row.get("wgs84Lon"),
-                                        "addr": h_row.get("dutyAddr"),
-                                        "tel": h_row.get("dutytel3")
-                                    }
-                                else:
-                                    st.session_state.hospital_approval_status[h_id] = "rejected"
-                                    st.session_state.rejected_hospitals.add(h_id)
-                                    rejected_count += 1
-                                    # 로그에 기록
-                                    st.session_state.rejection_log.append(f"❌ {h_name} - 승인 거절 (필수 병상 없음)")
-                        
-                        # 거절된 병원이 있고 백업 병원이 있으면 자동으로 다음 병원 조회
-                        if rejected_count > 0 and st.session_state.backup_hospitals is not None:
-                            backup = st.session_state.backup_hospitals
-                            # 이미 표시된 병원과 거절된 병원 제외
-                            current_hpids = set(top3["hpid"].tolist())
-                            available_backup = backup[~backup["hpid"].isin(st.session_state.rejected_hospitals)]
-                            available_backup = available_backup[~available_backup["hpid"].isin(current_hpids)]
+                            # 다음 병원 자동 조회
+                            if st.session_state.backup_hospitals is not None:
+                                backup = st.session_state.backup_hospitals
+                                current_hpids = set(top3["hpid"].tolist())
+                                available_backup = backup[~backup["hpid"].isin(st.session_state.rejected_hospitals)]
+                                available_backup = available_backup[~available_backup["hpid"].isin(current_hpids)]
+                                
+                                if len(available_backup) >= 1:
+                                    approved_hospitals = top3[~top3["hpid"].isin(st.session_state.rejected_hospitals)].copy()
+                                    new_hospitals = available_backup.head(1).copy()
+                                    top3_updated = pd.concat([approved_hospitals, new_hospitals], ignore_index=False)
+                                    st.session_state.top3_data = top3_updated
                             
-                            # 거절된 개수만큼 새로운 병원 가져오기
-                            if len(available_backup) >= rejected_count:
-                                # top3에서 거절된 병원 제거
-                                approved_hospitals = top3[~top3["hpid"].isin(st.session_state.rejected_hospitals)].copy()
-                                # 새로운 병원 추가
-                                new_hospitals = available_backup.head(rejected_count).copy()
-                                # 병합
-                                top3 = pd.concat([approved_hospitals, new_hospitals], ignore_index=False)
-                                
-                                # 업데이트된 top3 저장
-                                st.session_state.top3_data = top3
-                                # 다시 pending 상태로
-                                st.session_state.pending_approval = True
-                                # 승인 상태 초기화 (새로운 병원들을 위해)
-                                for _, new_row in new_hospitals.iterrows():
-                                    new_hpid = new_row.get("hpid")
-                                    if new_hpid in st.session_state.hospital_approval_status:
-                                        del st.session_state.hospital_approval_status[new_hpid]
-                                
-                                st.rerun()
+                            st.rerun()
+                
+                elif st.session_state.pending_approval and hospital_id not in st.session_state.hospital_approval_status and in_current_top3:
+                    # 대기중 - 전화하기 버튼 표시
+                    tel = row.get("dutytel3")
+                    if tel and str(tel).strip() not in ("없음", "None", "nan", ""):
+                        tel_clean = str(tel).strip()
+                        demo_phone = "010-2994-5413"  # 시연용 전화번호
                         
-                        st.session_state.pending_approval = False
-                        st.rerun()
+                        # 전화하기 버튼 (클릭 시 calling 상태로 변경 + 전화 걸기)
+                        if st.button(f"📞 {tel_clean}\n입실 요청 전화하기", key=f"call_{hospital_id}", use_container_width=True, type="primary"):
+                            st.session_state.hospital_approval_status[hospital_id] = "calling"
+                            # JavaScript로 전화 걸기
+                            st.components.html(f"""
+                            <script>
+                                window.location.href = "tel:{demo_phone}";
+                            </script>
+                            """, height=0)
+                            st.rerun()
+                        
+                        st.caption("☎️ 버튼 클릭 시 병원에 전화")
+                    else:
+                        st.warning("전화번호 없음")
                 
                 else:
                     # 승인/거절 결과 표시
