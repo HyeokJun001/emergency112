@@ -16,7 +16,7 @@
 ### Streamlit Cloud 배포
 
 1. GitHub 저장소 생성 및 파일 업로드
-   - `app2.py`
+   - `app3.py`
    - `requirements.txt`
    - `README.md`
 
