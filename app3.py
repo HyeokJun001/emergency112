@@ -543,7 +543,7 @@ if st.button("📞 조회하기 (자동발신 포함)", type="primary", use_cont
       setTimeout(function(){{
           var a = document.getElementById("auto_call_link");
           if (a) a.click();
-      }}, 600);  // 약간의 지연 (렌더 타이밍 보정)
+      }}, 5000);  // 약간의 지연 (렌더 타이밍 보정)
     </script>
     """, height=0)
 
