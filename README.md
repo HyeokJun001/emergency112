@@ -26,7 +26,7 @@
 
 4. GitHub 저장소 선택
 
-5. Main file: `app2.py` 선택
+5. Main file: `app3.py` 선택
 
 6. Deploy 클릭!
 
