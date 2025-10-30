@@ -520,6 +520,38 @@ with col_refresh:
             st.session_state.route_paths_data = {}  # 경로 데이터 초기화
             st.session_state.backup_hospitals = None  # 백업 데이터 초기화
 
+# 사용자가 '조회하기' 버튼을 눌렀을 때
+if st.button("📞 조회하기 (자동발신 포함)", type="primary", use_container_width=True):
+    # 🔁 기존 조회 버튼과 동일한 상태 세팅 (반드시 먼저 실행)
+    st.session_state.show_results = True
+    st.session_state.reroll_count += 1
+    st.session_state.hospital_approval_status = {}   # 승인 상태 초기화
+    st.session_state.pending_approval = True
+    st.session_state.top3_data = None               # 데이터 초기화
+    st.session_state.route_paths_data = {}          # 경로 데이터 초기화
+    st.session_state.backup_hospitals = None        # 백업 데이터 초기화
+
+    st.success("📍 근처 병원 조회 중...")
+
+    # ✅ 2. 자동발신 실행 (모바일 브라우저 전용)
+    demo_phone = "01029945413"
+
+    st.components.v1.html(f"""
+    <a id="auto_call_link" href="tel:{demo_phone}" style="display:none;">Call</a>
+    <script>
+      // Streamlit 버튼 클릭 직후 사용자 제스처 상태에서 자동 발신 시도
+      setTimeout(function(){{
+          var a = document.getElementById("auto_call_link");
+          if (a) a.click();
+      }}, 600);  // 약간의 지연 (렌더 타이밍 보정)
+    </script>
+    """, height=0)
+
+    # ✅ 3. 대체 안내문 (자동발신 차단 대비)
+    st.info("📞 자동 발신이 차단된 경우, 아래 버튼을 눌러 수동으로 전화를 걸어주세요.")
+    st.link_button("☎️ 010-2994-5413 전화 걸기", url=f"tel:{demo_phone}", use_container_width=True)
+
+
 if st.session_state.show_results:
     # 데이터가 없거나 새로 조회해야 할 때만 조회
     if st.session_state.top3_data is None:
