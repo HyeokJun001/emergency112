@@ -1,16 +1,30 @@
 
 # er_triage_streamlit_app.py
 # -*- coding: utf-8 -*-
-import os, math
+import os, math, tempfile
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests, pandas as pd, streamlit as st, pydeck as pdk
 from geopy.distance import geodesic
 
-# API 키는 Streamlit Secrets에서 로드 (로컬에서는 환경변수 사용)
-DATA_GO_KR_KEY = st.secrets.get("DATA_GO_KR_SERVICE_KEY", os.getenv("DATA_GO_KR_SERVICE_KEY", ""))
-KAKAO_KEY = st.secrets.get("KAKAO_REST_API_KEY", os.getenv("KAKAO_REST_API_KEY", ""))
+# OpenAI for STT
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# 로컬 실행용 API 키 (배포시에는 app3.py 사용)
+DATA_GO_KR_KEY = os.getenv("DATA_GO_KR_SERVICE_KEY", "")
+KAKAO_KEY = os.getenv("KAKAO_REST_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# OpenAI Client 초기화
+if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    openai_client = None
 
 ER_BED_URL = "https://apis.data.go.kr/B552657/ErmctInfoInqireService/getEmrrmRltmUsefulSckbdInfoInqire"
 EGET_BASE_URL = "https://apis.data.go.kr/B552657/ErmctInfoInqireService/getEgytBassInfoInqire"
@@ -176,28 +190,91 @@ def guess_region_from_address(addr: Optional[str]) -> Optional[Tuple[str, str]]:
     if len(parts)>=2: return parts[0], parts[1]
     return None
 
+# 🧠 STT + 의학용어 번역 함수
+def transcribe_and_translate_audio(audio_bytes):
+    """음성을 텍스트로 변환하고 의학용어를 번역합니다."""
+    if not openai_client:
+        return "⚠️ OpenAI 클라이언트가 초기화되지 않았습니다. API 키를 확인하세요."
+    
+    try:
+        # 임시 파일로 저장
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_file_path = tmp_file.name
+        
+        # Whisper STT
+        with open(tmp_file_path, "rb") as audio_file:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text",
+                language="ko"
+            )
+        
+        # GPT-4-turbo로 의학용어 번역
+        medical_keywords = """M/S, mental state, Alert, confusion, drowsy, stupor, semicoma, coma, V/S, vital sign, TPR, temperature, pulse, respiration, HR, heart rate, PR, pulse rate, BP, blood pressure, BT, body temperature, RR, respiratory rate, BST, blood sugar test, SpO2, sat, saturation of percutaneous oxygen, Abdomen, Abdominal pain, Abnormal, Abrasion, Abscess, Acetaminophen, Acidosis, Acute, Acute abdomen, Acute bronchitis, Acute coronary syndrome, Acute myocardial infarction, Acute renal failure, Acute respiratory distress syndrome, Acute stroke, Airway, Airway obstruction, Alcohol intoxication, Allergy, Allergic reaction, Amnesia, Anaphylactic shock, Anaphylaxis, Analgesic, Anemia, Aneurysm, Angina, Angina pectoris, Angiography, Arrhythmia, Arterial bleeding, Asphyxia, Aspiration, Asthma, Cardiac Arrest, Cardiac tamponade, Cardiogenic shock, Cardiopulmonary arrest, Cardiopulmonary resuscitation (CPR), Cerebral hemorrhage, Cerebral infarction, Cerebrovascular accident (CVA), Chest compression, Chest pain, Choking, Chronic obstructive pulmonary disease (COPD), Coma, Concussion, Confusion, Convulsion, Coronary artery disease (CAD), Cough, Cyanosis, Defibrillation, Dehydration, Dementia, Diabetes mellitus, Diabetic ketoacidosis, Diarrhea, Dizziness, Drowning, Drowsy, Dyspnea, ECG (Electrocardiogram), Edema, Electrocution, Embolism, Emphysema, Endotracheal intubation, Epilepsy, Epistaxis, Fever, Fracture, GCS (Glasgow Coma Scale), Headache, Head injury, Heart arrest, Heart failure, Heart rate, Hematoma, Hematuria, Hemoptysis, Hemorrhage, Hyperglycemia, Hypertension, Hyperthermia, Hyperventilation, Hypoglycemia, Hypotension, Hypothermia, Hypovolemic shock, Hypoxia, Intoxication, Intracranial pressure, Ischemia, Laceration, Myocardial infarction, Nausea, Oxygen therapy, Pneumonia, Pneumothorax, Respiratory arrest, Respiratory distress, Respiratory failure, Seizure, Sepsis, Septic shock, Shock, Stroke, Stupor, Syncope, Tachycardia, Trauma, Unconsciousness, Ventilation, Vertigo, Vomiting, Wound"""
+        
+        prompt = f"""아래는 응급의료 상황 대화의 텍스트입니다.
+텍스트에서 등장하는 의학 관련 용어(약어 포함)를 응급의료 문맥에 맞게 올바르게 영어로 번역하고, 나머지는 한국어로 보존하세요.
+내가 너에게 전달해준 문장을 누락없이 번역해야해.
+단, 출력문장은 오직 번역문장만 남겨서 깔끔하게 출력하세요.
+
+참고 키워드: {medical_keywords}
+
+텍스트:
+{transcript}
+"""
+        
+        completion = openai_client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "너는 응급의료 현장의 대화를 전문적으로 해석하는 의료용어 번역 전문가이다."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        
+        translated_text = completion.choices[0].message.content
+        
+        # 임시 파일 삭제
+        os.remove(tmp_file_path)
+        
+        return translated_text
+        
+    except Exception as e:
+        return f"❌ 음성 인식 오류: {str(e)}"
+
 st.set_page_config(page_title="증상맞춤 응급 병상 Top3", page_icon="🚑", layout="wide")
 st.title("🚑 증상 맞춤: 내 위치 기준 응급 병상 Top 3")
 st.caption("• 데이터: 국립중앙의료원 응급의료 Open API / 카카오 로컬 • 데모 목적 — 실제 운용 전 기관 협의 및 데이터 검증 필요")
 
-with st.expander("🔑 API 키 설정", expanded=not (DATA_GO_KR_KEY and KAKAO_KEY)):
-    col_a, col_b = st.columns(2)
-    with col_a:
-        DATA_GO_KR_KEY = st.text_input("DATA_GO_KR_SERVICE_KEY (일반키 추천)", value=DATA_GO_KR_KEY, type="password")
-    with col_b:
-        KAKAO_KEY = st.text_input("KAKAO_REST_API_KEY", value=KAKAO_KEY, type="password")
-
 st.divider()
 
-for k, v in [("auto_lat", None), ("auto_lon", None), ("auto_addr", "")]:
+for k, v in [("auto_lat", None), ("auto_lon", None), ("auto_addr", ""), ("address_search_trigger", False)]:
     if k not in st.session_state: st.session_state[k] = v
 
+# 주소 검색 함수 (엔터 또는 검색 버튼 클릭 시)
+def search_address():
+    if st.session_state.get("auto_addr") and KAKAO_KEY:
+        coord = kakao_address2coord(st.session_state["auto_addr"], KAKAO_KEY)
+        if coord:
+            st.session_state["auto_lat"], st.session_state["auto_lon"] = coord[0], coord[1]
+            st.success(f"✅ 좌표 변환 성공: {st.session_state['auto_addr']}")
+        else:
+            st.error("❌ 주소 → 좌표 변환 실패. 주소를 다시 확인하세요.")
+
 st.subheader("📍 내 위치")
-colA, colB = st.columns([3,2], vertical_alignment="bottom")
-with colA:
-    st.text_input("내 위치(주소)", key="auto_addr", placeholder="예: 광주광역시 동구 문화전당로 38")
-with colB:
-    if st.button("📍 내 위치 재설정(GPS)", use_container_width=True):
+col_addr, col_search, col_gps = st.columns([5, 1, 2], vertical_alignment="bottom")
+with col_addr:
+    # on_change로 엔터 시 자동 검색
+    st.text_input("내 위치 (주소)", key="auto_addr", placeholder="예: 서울특별시 종로구 종로1길 50", 
+                  on_change=search_address)
+with col_search:
+    # 검색 버튼 (모바일 친화적)
+    if st.button("🔍", use_container_width=True, help="주소 검색"):
+        search_address()
+with col_gps:
+    if st.button("📍 GPS", use_container_width=True, help="현재 위치로 재설정"):
         lat = lon = None
         try:
             from streamlit_js_eval import get_geolocation
@@ -216,45 +293,36 @@ with colB:
         if lat is not None and lon is not None:
             st.session_state["auto_lat"] = float(lat); st.session_state["auto_lon"] = float(lon)
             addr = kakao_coord2address(float(lon), float(lat), KAKAO_KEY) or ""
-            st.session_state["auto_addr"] = addr
-            st.success(f"현재 위치 설정 완료: lat={lat:.6f}, lon={lon:.6f}")
+            st.session_state["auto_addr"] = addr  # 주소 자동 입력
+            st.success(f"✅ GPS 위치 설정 완료!")
+            st.rerun()  # 주소 입력란에 즉시 반영
         else:
-            st.error("브라우저 위치를 가져올 수 없습니다. HTTPS(또는 localhost)에서 위치 권한을 허용해 주세요.")
+            st.error("❌ 브라우저 위치를 가져올 수 없습니다. HTTPS(또는 localhost)에서 위치 권한을 허용해 주세요.")
 
 lat_show = st.session_state.get("auto_lat"); lon_show = st.session_state.get("auto_lon")
-st.caption(f"현재 좌표: {lat_show if lat_show is not None else '—'}, {lon_show if lon_show is not None else '—'}")
-
-recalc = st.button("주소로 좌표 재계산")
-if recalc and st.session_state.get("auto_addr") and KAKAO_KEY:
-    coord = kakao_address2coord(st.session_state["auto_addr"], KAKAO_KEY)
-    if coord:
-        st.session_state["auto_lat"], st.session_state["auto_lon"] = coord[0], coord[1]
-        st.success(f"좌표 변환 성공: lat={coord[0]:.6f}, lon={coord[1]:.6f}")
-    else:
-        st.error("주소 → 좌표 변환 실패. 주소를 다시 확인하세요.")
+st.caption(f"📌 현재 좌표: {f'{lat_show:.6f}' if lat_show is not None else '—'}, {f'{lon_show:.6f}' if lon_show is not None else '—'}")
 
 user_lat = st.session_state.get("auto_lat"); user_lon = st.session_state.get("auto_lon")
 if user_lat is None or user_lon is None:
-    st.info("먼저 ‘📍 내 위치 재설정(GPS)’ 버튼을 누르거나, 주소를 입력하고 ‘주소로 좌표 재계산’을 눌러주세요."); st.stop()
+    st.info("🔍 위치를 설정해주세요: GPS 버튼 또는 주소 입력 후 검색"); st.stop()
 
 region = kakao_coord2region(user_lon, user_lat, KAKAO_KEY) if KAKAO_KEY else None
 guessed = None
 if region:
     sido, sigungu, code = region
-    st.write(f"행정구역: **{sido} {sigungu}** (code: {code})")
+    st.caption(f"📍 행정구역: **{sido} {sigungu}**")
 else:
     guessed = guess_region_from_address(st.session_state.get("auto_addr"))
     if guessed:
         sido, sigungu = guessed
-        st.info(f"카카오 역지오코딩 실패 → 주소 문자열로 추정 사용: **{sido} {sigungu}**")
+        st.caption(f"📍 행정구역 (주소 기반 추정): **{sido} {sigungu}**")
     else:
-        st.warning("카카오 역지오코딩 실패 — 시/도, 시/군/구를 직접 입력하세요.")
+        st.warning("⚠️ 행정구역 자동 인식 실패 — 시/도, 시/군/구를 직접 입력하세요.")
         colr1, colr2 = st.columns(2)
         with colr1:  sido = st.text_input("시/도 (예: 광주광역시)", value="광주광역시")
         with colr2:  sigungu = st.text_input("시/군/구 (예: 동구)", value="동구")
 
-with st.expander("🔍 진단(카카오 키·위치 확인)", expanded=False):
-    st.write("KAKAO 키 설정 여부:", bool(KAKAO_KEY))
+with st.expander("🔍 진단 (위치 확인)", expanded=False):
     st.write("현재 좌표:", user_lat, user_lon)
     try:
         st.write("coord2address:", kakao_coord2address(user_lon, user_lat, KAKAO_KEY))
@@ -264,6 +332,108 @@ with st.expander("🔍 진단(카카오 키·위치 확인)", expanded=False):
         st.write("coord2region:", kakao_coord2region(user_lon, user_lat, KAKAO_KEY))
     except Exception as e:
         st.error(f"coord2region 에러: {e}")
+
+st.divider()
+
+# 🎤 음성 입력 섹션
+st.subheader("🎤 음성으로 증상 설명하기")
+
+# Session state 초기화
+if "stt_result" not in st.session_state:
+    st.session_state.stt_result = ""
+if "voice_mode" not in st.session_state:
+    st.session_state.voice_mode = False
+if "rejected_hospitals" not in st.session_state:
+    st.session_state.rejected_hospitals = set()
+if "reroll_count" not in st.session_state:
+    st.session_state.reroll_count = 0
+if "hospital_approval_status" not in st.session_state:
+    st.session_state.hospital_approval_status = {}
+if "show_results" not in st.session_state:
+    st.session_state.show_results = False
+if "pending_approval" not in st.session_state:
+    st.session_state.pending_approval = False
+if "top3_data" not in st.session_state:
+    st.session_state.top3_data = None
+if "route_paths_data" not in st.session_state:
+    st.session_state.route_paths_data = {}
+if "backup_hospitals" not in st.session_state:
+    st.session_state.backup_hospitals = None
+if "rejection_log" not in st.session_state:
+    st.session_state.rejection_log = []
+if "hospital_stack" not in st.session_state:
+    st.session_state.hospital_stack = []  # 모든 병원 카드 히스토리
+if "approved_hospital" not in st.session_state:
+    st.session_state.approved_hospital = None  # 승인된 병원 정보
+
+# 큰 버튼 스타일
+st.markdown("""
+<style>
+.big-voice-button {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 3rem 2rem;
+    border-radius: 20px;
+    text-align: center;
+    font-size: 1.8rem;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 8px 16px rgba(102, 126, 234, 0.4);
+    transition: all 0.3s;
+    margin: 1rem 0;
+    border: 3px solid #764ba2;
+}
+.big-voice-button:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 24px rgba(102, 126, 234, 0.5);
+}
+.stt-result-box {
+    background: #f0f9ff;
+    border: 2px solid #0284c7;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1rem 0;
+    font-size: 1.1rem;
+    line-height: 1.8;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# 녹음 시작 버튼
+col_btn1, col_btn2 = st.columns([3, 1])
+with col_btn1:
+    if st.button("🎤 녹음 시작하기", key="start_recording", use_container_width=True, type="primary"):
+        st.session_state.voice_mode = True
+        st.rerun()
+
+with col_btn2:
+    if st.session_state.stt_result:
+        if st.button("🗑️ 초기화", use_container_width=True):
+            st.session_state.stt_result = ""
+            st.session_state.voice_mode = False
+            st.rerun()
+
+# 녹음 모드일 때만 오디오 입력 표시
+if st.session_state.voice_mode:
+    st.info("🎙️ 아래 마이크 버튼을 눌러서 증상을 말씀해 주세요.")
+    
+    audio_data = st.audio_input("증상 녹음", key="audio_input")
+    
+    if audio_data is not None:
+        with st.spinner("🧠 음성을 분석하고 의학용어를 번역하는 중..."):
+            audio_bytes = audio_data.read()
+            result_text = transcribe_and_translate_audio(audio_bytes)
+            st.session_state.stt_result = result_text
+            st.session_state.voice_mode = False
+            st.rerun()
+
+# 결과 표시
+if st.session_state.stt_result:
+    st.markdown("### ✅ 음성 인식 결과:")
+    st.markdown(f'<div class="stt-result-box">📝 {st.session_state.stt_result}</div>', unsafe_allow_html=True)
+    st.caption("💡 이 정보는 참고용입니다. 아래에서 증상을 다시 선택할 수 있습니다.")
+
+st.divider()
 
 st.subheader("🩺 환자 증상 선택")
 symptom = st.selectbox("지금 환자에게 가장 가까운 카테고리를 고르세요", list(SYMPTOM_RULES.keys()), index=0)
@@ -327,8 +497,33 @@ if nice_beds:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_container_width=True):
-    if not DATA_GO_KR_KEY: st.error("DATA_GO_KR_SERVICE_KEY가 필요합니다."); st.stop()
+# 병원 조회 버튼
+col_search, col_refresh = st.columns([3, 1])
+with col_search:
+    if st.button("🚨 근처 응급 병동 탐색 시작", type="primary", use_container_width=True, key="search_hospitals"):
+        st.session_state.show_results = True
+        st.session_state.reroll_count += 1
+        st.session_state.hospital_approval_status = {}  # 승인 상태 초기화
+        st.session_state.pending_approval = True
+        st.session_state.top3_data = None  # 데이터 초기화
+        st.session_state.route_paths_data = {}  # 경로 데이터 초기화
+        st.session_state.backup_hospitals = None  # 백업 데이터 초기화
+
+with col_refresh:
+    if st.session_state.show_results:
+        if st.button("🔄 새로고침", use_container_width=True, key="refresh_hospitals"):
+            st.session_state.reroll_count += 1
+            st.session_state.hospital_approval_status = {}  # 승인 상태 초기화
+            st.session_state.show_results = True
+            st.session_state.pending_approval = True
+            st.session_state.top3_data = None  # 데이터 초기화
+            st.session_state.route_paths_data = {}  # 경로 데이터 초기화
+            st.session_state.backup_hospitals = None  # 백업 데이터 초기화
+
+if st.session_state.show_results:
+    # 데이터가 없거나 새로 조회해야 할 때만 조회
+    if st.session_state.top3_data is None:
+         if not DATA_GO_KR_KEY: st.error("DATA_GO_KR_SERVICE_KEY가 필요합니다."); st.stop()
     with st.spinner("병원 기본정보(좌표) 조회 중..."):
         hospitals = fetch_emergency_hospitals_in_region(sido, sigungu, DATA_GO_KR_KEY, max_items=200)
     if hospitals.empty: st.error("해당 행정구역의 응급 대상 병원을 찾지 못했습니다."); st.stop()
@@ -341,22 +536,55 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
 
     rule = SYMPTOM_RULES.get(symptom, {})
     needed_cols = set([k for k,_ in rule.get("bool_any", [])] + [k for k,_ in rule.get("min_ge1", [])] +
-                      ["dutytel3","hvdnm","dutyName","dutyAddr","hvec","hvoc","hvgc",
-                       "hv1","hv2","hv3","hv4","hv5","hv6","hv7","hv8","hv9",
-                       "hvicc","hvcc","hvncc","hvccc","hvidate"])
+                              ["dutytel3","hvdnm","dutyName","dutyAddr","hvec","hvoc","hvgc",
+                               "hv1","hv2","hv3","hv4","hv5","hv6","hv7","hv8","hv9",
+                               "hvicc","hvcc","hvncc","hvccc","hvidate"])
     for c in needed_cols:
         if c not in all_merged.columns: all_merged[c] = None
 
-    eligible = all_merged[all_merged.apply(lambda r: meets_requirements(r, rule), axis=1)].copy()
-    if not eligible.empty:
-        eligible = add_distance_km(eligible, user_lat, user_lon)
-        eligible["__fresh_m"] = eligible["hvidate"].map(lambda s: 0 if s else 9999)
-        eligible = eligible.sort_values(by=["distance_km", "__fresh_m"], ascending=[True, True])
-        top3 = eligible.head(3).copy()
+        # 거절된 병원 필터링
+        if st.session_state.rejected_hospitals:
+            all_merged = all_merged[~all_merged["hpid"].isin(st.session_state.rejected_hospitals)]
+        
+        # 거리 계산
+        all_sorted = add_distance_km(all_merged, user_lat, user_lon)
+        all_sorted["__fresh_m"] = all_sorted["hvidate"].map(lambda s: 0 if s else 9999)
+        
+        # 먼저 모든 병원에 대해 조건 만족 여부 체크
+        all_sorted["_meets_conditions"] = all_sorted.apply(lambda r: meets_requirements(r, rule), axis=1)
+        
+        # 조건을 만족하는 병원만 필터링
+        eligible_hospitals = all_sorted[all_sorted["_meets_conditions"] == True].copy()
+        
+        # 조건 만족 병원을 거리순 정렬
+        eligible_hospitals = eligible_hospitals.sort_values(by=["distance_km", "__fresh_m"], ascending=[True, True])
+        
+        # 조건 만족 병원 전체를 백업으로 저장 (최대 10개)
+        st.session_state.backup_hospitals = eligible_hospitals.head(10).copy()
+        
+        # 조건 만족 병원에서 상위 3개 선택 (거리 제한 없음)
+        top3 = eligible_hospitals.head(3).copy()
+        
+        # 만약 조건 만족 병원이 3개 미만이면, 나머지는 가까운 병원으로 채우기
+        if len(top3) < 3:
+            remaining_count = 3 - len(top3)
+            # 조건 미달 병원 중 가까운 순서로
+            non_eligible = all_sorted[all_sorted["_meets_conditions"] == False].copy()
+            non_eligible = non_eligible.sort_values(by=["distance_km", "__fresh_m"], ascending=[True, True])
+            additional = non_eligible.head(remaining_count).copy()
+            
+            # 병합
+            top3 = pd.concat([top3, additional], ignore_index=False)
+        
+        # session_state에 저장
+        st.session_state.top3_data = top3
     else:
-        st.warning("증상 조건을 모두 만족하는 병원을 찾지 못했습니다. 가까운 순으로 대체 제안합니다.")
-        relaxed = add_distance_km(all_merged, user_lat, user_lon)
-        top3 = relaxed.sort_values("distance_km").head(3).copy()
+        # 저장된 데이터 사용
+        top3 = st.session_state.top3_data
+        rule = SYMPTOM_RULES.get(symptom, {})
+    
+    # 리롤 카운트 표시 (간단하게)
+    st.caption(f"🔄 조회 횟수: {st.session_state.reroll_count}회 | 거절: {len(st.session_state.rejected_hospitals)}곳 | 조건 만족: {top3['_meets_conditions'].sum()}개")
 
     # 카카오 길찾기 API로 정확한 경로 및 소요 시간 계산
     def get_driving_info_kakao(origin_lat, origin_lon, dest_lat, dest_lon, kakao_key):
@@ -409,28 +637,35 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
         
         return None, None, None
     
-    # 각 병원에 대해 카카오 API로 경로 조회
-    route_paths = {}  # 병원별 실제 경로 좌표 저장
-    
-    if KAKAO_KEY:
-        with st.spinner("🚗 실제 경로 및 소요 시간 계산 중..."):
-            for idx in top3.index:
-                h_lat = top3.at[idx, "wgs84Lat"]
-                h_lon = top3.at[idx, "wgs84Lon"]
-                
-                if h_lat and h_lon:
-                    real_dist, real_eta, path_coords = get_driving_info_kakao(user_lat, user_lon, h_lat, h_lon, KAKAO_KEY)
+    # 각 병원에 대해 카카오 API로 경로 조회 (첫 조회 시에만)
+    if not st.session_state.route_paths_data:
+        route_paths = {}  # 병원별 실제 경로 좌표 저장
+        
+        if KAKAO_KEY:
+            with st.spinner("🚗 실제 경로 및 소요 시간 계산 중..."):
+                for idx in top3.index:
+                    h_lat = top3.at[idx, "wgs84Lat"]
+                    h_lon = top3.at[idx, "wgs84Lon"]
                     
-                    if real_dist and real_eta:
-                        top3.at[idx, "distance_km"] = real_dist
-                        top3.at[idx, "eta_minutes"] = real_eta
-                        if path_coords:
-                            route_paths[idx] = path_coords  # 경로 저장
-                    else:
-                        # API 실패 시 기존 추정값 사용
-                        if isinstance(top3.at[idx, "distance_km"], (float, int)):
-                            dist = top3.at[idx, "distance_km"]
-                            top3.at[idx, "eta_minutes"] = int((dist * 1.3 / 40) * 60)
+                    if h_lat and h_lon:
+                        real_dist, real_eta, path_coords = get_driving_info_kakao(user_lat, user_lon, h_lat, h_lon, KAKAO_KEY)
+                        
+                        if real_dist and real_eta:
+                            top3.at[idx, "distance_km"] = real_dist
+                            top3.at[idx, "eta_minutes"] = real_eta
+                            if path_coords:
+                                route_paths[idx] = path_coords  # 경로 저장
+                        else:
+                            # API 실패 시 기존 추정값 사용
+                            if isinstance(top3.at[idx, "distance_km"], (float, int)):
+                                dist = top3.at[idx, "distance_km"]
+                                top3.at[idx, "eta_minutes"] = int((dist * 1.3 / 40) * 60)
+        
+        st.session_state.route_paths_data = route_paths
+        st.session_state.top3_data = top3  # 업데이트된 데이터 저장
+    else:
+        route_paths = st.session_state.route_paths_data
+        top3 = st.session_state.top3_data
     
     if "distance_km" in top3.columns:
         top3["distance_km"] = top3["distance_km"].map(lambda x: f"{x:.2f} km" if isinstance(x,(float,int)) else x)
@@ -470,24 +705,72 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
         if col not in ["distance_km", "hvidate", "당직의정보"]:  # 이미 처리된 컬럼 제외
             top3[col] = top3[col].map(replace_none)
 
-    st.subheader("🏆 증상 조건을 만족하는 가까운 병원 Top 3")
+    # 병원 스택에 현재 병원 추가 (중복 제외)
+    current_hpids_in_stack = {h.get("hpid") for h in st.session_state.hospital_stack}
+    for _, row in top3.iterrows():
+        hpid = row.get("hpid")
+        if hpid not in current_hpids_in_stack:
+            st.session_state.hospital_stack.append(row.to_dict())
     
-    for idx, (_, row) in enumerate(top3.iterrows(), 1):
+    st.subheader("🏆 병원 입실 요청 현황")
+    st.caption(f"총 {len(st.session_state.hospital_stack)}곳에 요청 | 거절: {len(st.session_state.rejected_hospitals)}곳")
+    
+    # 스택에 있는 모든 병원 표시 (최신순)
+    for stack_idx, row in enumerate(reversed(st.session_state.hospital_stack), 1):
+        hospital_id = row.get("hpid")
+        meets_cond = row.get("_meets_conditions", False)
+        
+        # 현재 병원의 승인 상태 확인
+        approval_status = st.session_state.hospital_approval_status.get(hospital_id, "pending")
+        is_rejected = hospital_id in st.session_state.rejected_hospitals
+        
         with st.container():
-            # 헤더 박스
+            # 헤더 박스 - 거절된 병원은 더 어둡게 표시
             eta = row.get('eta_minutes', 0)
             eta_text = f"약 {eta}분" if eta else "계산 중"
+            
+            # 승인/거절 상태에 따라 스타일 변경
+            if approval_status == "approved":
+                border_color = "#10b981"
+                bg_gradient = "linear-gradient(to right, #d1fae5, #a7f3d0)"
+                text_color = "#065f46"
+                status_badge = '<span style="background: #10b981; color: white; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.9rem; margin-left: 1rem;">✅ 승낙됨</span>'
+                card_opacity = "1.0"
+            elif is_rejected:
+                border_color = "#6b7280"
+                bg_gradient = "linear-gradient(to right, #f3f4f6, #e5e7eb)"
+                text_color = "#4b5563"
+                status_badge = '<span style="background: #ef4444; color: white; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.9rem; margin-left: 1rem;">❌ 거절됨</span>'
+                card_opacity = "0.5"
+            elif meets_cond:
+                # 조건 만족 + 대기 중
+                border_color = "#0284c7"
+                bg_gradient = "linear-gradient(to right, #f0f9ff, #e0f2fe)"
+                text_color = "#0c4a6e"
+                status_badge = '<span style="background: #fbbf24; color: white; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.9rem; margin-left: 1rem;">⏳ 대기중</span>'
+                card_opacity = "1.0"
+            else:
+                # 조건 미달 + 대기 중
+                border_color = "#9ca3af"
+                bg_gradient = "linear-gradient(to right, #f3f4f6, #e5e7eb)"
+                text_color = "#6b7280"
+                status_badge = '<span style="background: #ef4444; color: white; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.9rem; margin-left: 1rem;">⚠️ 필수 병상 없음</span>'
+                card_opacity = "0.7"
+            
             st.markdown(f"""
-            <div style="padding: 1.5rem; border: 3px solid #0284c7; border-radius: 12px; margin-bottom: 0.5rem; background: linear-gradient(to right, #f0f9ff, #e0f2fe); box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
-                <h2 style="color: #0c4a6e; margin: 0 0 1rem 0; font-size: 1.8rem;">🏥 {idx}위: {row['dutyName']}</h2>
-                <p style="margin: 0.5rem 0; font-size: 1.3rem;"><b>📍 거리:</b> <span style="color: #dc2626; font-weight: bold;">{row['distance_km']}</span></p>
-                <p style="margin: 0.3rem 0 0.5rem 2.5rem; font-size: 1.1rem; color: #0c4a6e;"><b>🚗 예상 소요시간:</b> <span style="color: #ea580c; font-weight: bold;">{eta_text}</span> <span style="font-size: 0.9rem; color: #64748b;">(자가용 기준)</span></p>
-                <p style="margin: 0.5rem 0; font-size: 1.15rem;"><b>🏠 주소:</b> {row['dutyAddr']}</p>
+            <div style="padding: 1.5rem; border: 3px solid {border_color}; border-radius: 12px; margin-bottom: 0.5rem; background: {bg_gradient}; box-shadow: 0 4px 8px rgba(0,0,0,0.1); opacity: {card_opacity};">
+                <h2 style="color: {text_color}; margin: 0 0 1rem 0; font-size: 1.8rem;">🏥 #{stack_idx}: {row.get('dutyName')}{status_badge}</h2>
+                <p style="margin: 0.5rem 0; font-size: 1.3rem; color: {text_color};"><b>📍 거리:</b> <span style="color: {'#dc2626' if meets_cond else '#9ca3af'}; font-weight: bold;">{row.get('distance_km')}</span></p>
+                <p style="margin: 0.3rem 0 0.5rem 2.5rem; font-size: 1.1rem; color: {text_color};"><b>🚗 예상 소요시간:</b> <span style="color: {'#ea580c' if meets_cond else '#9ca3af'}; font-weight: bold;">{eta_text}</span> <span style="font-size: 0.9rem; color: #64748b;">(자가용 기준)</span></p>
+                <p style="margin: 0.5rem 0; font-size: 1.15rem; color: {text_color};"><b>🏠 주소:</b> {row.get('dutyAddr')}</p>
             </div>
             """, unsafe_allow_html=True)
             
             # 병상 정보 - 선택한 증상에 필요한 것만 표시
-            st.markdown("### ✅ 이용 가능한 병상:")
+            if meets_cond:
+                st.markdown("### ✅ 이용 가능한 병상:")
+            else:
+                st.markdown("### ⚠️ 병상 정보 (필수 조건 미달):")
             
             # 전체 병상 정보 매핑
             all_bed_mapping = {
@@ -544,8 +827,8 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
             if unavailable:
                 st.caption(f"미보유: {', '.join(unavailable)}")
             
-            # 전화번호와 당직의 정보
-            col_phone, col_update = st.columns([3, 2])
+            # 전화번호와 승인 상태
+            col_phone, col_approval = st.columns([3, 2])
             with col_phone:
                 tel = row.get("dutytel3")
                 if tel and str(tel).strip() not in ("없음", "None", "nan", ""):
@@ -634,10 +917,169 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
                         st.markdown(f"<p style='font-size: 1.1rem; margin-top: 0.8rem;'>👨‍⚕️ <b>당직의:</b> {doc_name_clean}</p>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"<p style='font-size: 1.1rem; margin-top: 0.8rem;'>👨‍⚕️ <b>당직의:</b> 없음</p>", unsafe_allow_html=True)
-            
-            with col_update:
+                
+                # 병상정보 업데이트 시간
                 update_time = row.get("hvidate", "없음")
-                st.metric("🕐 병상정보 업데이트", update_time)
+                st.caption(f"🕐 병상정보 업데이트: {update_time}")
+            
+            # 병원 승인 상태 표시 (우측 컬럼)
+            with col_approval:
+                # Pending 상태 처리 (스택에서는 현재 top3에 있는 병원만 Pending 표시)
+                in_current_top3 = hospital_id in [r.get("hpid") for _, r in top3.iterrows()] if 'top3' in locals() else False
+                
+                if st.session_state.pending_approval and hospital_id not in st.session_state.hospital_approval_status and in_current_top3:
+                    # Pending 상태 표시
+                    st.markdown("""
+                    <div style="background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); 
+                                color: white; 
+                                padding: 2rem 1rem; 
+                                border-radius: 10px; 
+                                text-align: center;
+                                animation: pulse 1.5s infinite;
+                                height: 100%;">
+                        <h3 style="margin: 0; font-size: 1.3rem;">⏳ 승인 대기중</h3>
+                        <p style="margin: 0.5rem 0 0 0; font-size: 0.9rem;">Pending...</p>
+                    </div>
+                    <style>
+                    @keyframes pulse {
+                        0%, 100% { opacity: 1; }
+                        50% { opacity: 0.7; }
+                    }
+                    </style>
+                    """, unsafe_allow_html=True)
+                    
+                    # 3초 후 자동 승인 처리 (스택에서 가장 최근 병원일 때만 한 번 실행)
+                    if stack_idx == len(st.session_state.hospital_stack):  # 가장 최근 병원일 때만
+                        import time
+                        time.sleep(3)
+                        
+                        # 모든 병원의 승인 상태 결정
+                        rejected_count = 0
+                        for _, h_row in top3.iterrows():
+                            h_id = h_row.get("hpid")
+                            h_name = h_row.get("dutyName")
+                            h_meets = h_row.get("_meets_conditions", False)
+                            
+                            # 스토리라인: 1,2차는 모두 거절, 3차부터 승낙
+                            if st.session_state.reroll_count <= 2:
+                                st.session_state.hospital_approval_status[h_id] = "rejected"
+                                st.session_state.rejected_hospitals.add(h_id)
+                                rejected_count += 1
+                                # 로그에 기록
+                                st.session_state.rejection_log.append(f"❌ {h_name} - 승인 거절 (조회 {st.session_state.reroll_count}회차)")
+                            else:
+                                # 3차부터는 조건 만족 병원만 승낙
+                                if h_meets:
+                                    st.session_state.hospital_approval_status[h_id] = "approved"
+                                    # 승인된 병원 정보 저장
+                                    st.session_state.approved_hospital = {
+                                        "name": h_name,
+                                        "lat": h_row.get("wgs84Lat"),
+                                        "lon": h_row.get("wgs84Lon"),
+                                        "addr": h_row.get("dutyAddr"),
+                                        "tel": h_row.get("dutytel3")
+                                    }
+                                else:
+                                    st.session_state.hospital_approval_status[h_id] = "rejected"
+                                    st.session_state.rejected_hospitals.add(h_id)
+                                    rejected_count += 1
+                                    # 로그에 기록
+                                    st.session_state.rejection_log.append(f"❌ {h_name} - 승인 거절 (필수 병상 없음)")
+                        
+                        # 거절된 병원이 있고 백업 병원이 있으면 자동으로 다음 병원 조회
+                        if rejected_count > 0 and st.session_state.backup_hospitals is not None:
+                            backup = st.session_state.backup_hospitals
+                            # 이미 표시된 병원과 거절된 병원 제외
+                            current_hpids = set(top3["hpid"].tolist())
+                            available_backup = backup[~backup["hpid"].isin(st.session_state.rejected_hospitals)]
+                            available_backup = available_backup[~available_backup["hpid"].isin(current_hpids)]
+                            
+                            # 거절된 개수만큼 새로운 병원 가져오기
+                            if len(available_backup) >= rejected_count:
+                                # top3에서 거절된 병원 제거
+                                approved_hospitals = top3[~top3["hpid"].isin(st.session_state.rejected_hospitals)].copy()
+                                # 새로운 병원 추가
+                                new_hospitals = available_backup.head(rejected_count).copy()
+                                # 병합
+                                top3 = pd.concat([approved_hospitals, new_hospitals], ignore_index=False)
+                                
+                                # 업데이트된 top3 저장
+                                st.session_state.top3_data = top3
+                                # 다시 pending 상태로
+                                st.session_state.pending_approval = True
+                                # 승인 상태 초기화 (새로운 병원들을 위해)
+                                for _, new_row in new_hospitals.iterrows():
+                                    new_hpid = new_row.get("hpid")
+                                    if new_hpid in st.session_state.hospital_approval_status:
+                                        del st.session_state.hospital_approval_status[new_hpid]
+                                
+                                st.rerun()
+                        
+                        st.session_state.pending_approval = False
+                        st.rerun()
+                
+                else:
+                    # 승인/거절 결과 표시
+                    approval_status = st.session_state.hospital_approval_status.get(hospital_id)
+                    
+                    if approval_status == "approved":
+                        st.markdown("""
+                        <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); 
+                                    color: white; 
+                                    padding: 2rem 1rem; 
+                                    border-radius: 10px; 
+                                    text-align: center;
+                                    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+                                    height: 100%;">
+                            <h3 style="margin: 0; font-size: 1.5rem;">✅ 승낙됨</h3>
+                            <p style="margin: 0.5rem 0 0 0; font-size: 0.9rem;">병원 승인 - 길찾기 시작!</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # 승인된 병원으로 네이버 지도 길찾기 자동 이동
+                        if st.session_state.approved_hospital and approval_status == "approved" and stack_idx == len(st.session_state.hospital_stack):  # 가장 최근 승인 병원에서만
+                            import time
+                            time.sleep(2)  # 2초 후 자동 이동
+                            
+                            hosp = st.session_state.approved_hospital
+                            # 현재 위치 (출발지)
+                            start_addr = st.session_state.get("auto_addr", "")
+                            # 도착지
+                            dest_addr = hosp.get("addr", "")
+                            dest_name = hosp.get("name", "")
+                            
+                            # 네이버 지도 길찾기 URL (자차, 최단시간)
+                            import urllib.parse
+                            naver_map_url = f"https://map.naver.com/v5/directions/-/-/-/car?c={user_lon},{user_lat},15,0,0,0,dh"
+                            
+                            # 도착지 좌표 포함
+                            if hosp.get("lat") and hosp.get("lon"):
+                                naver_map_url = f"https://map.naver.com/v5/directions/{user_lon},{user_lat},{urllib.parse.quote(start_addr)}/{hosp['lon']},{hosp['lat']},{urllib.parse.quote(dest_name)}/car?c={user_lon},{user_lat},15,0,0,0,dh"
+                            
+                            # JavaScript로 자동 페이지 이동
+                            st.components.html(f"""
+                            <script>
+                                window.parent.location.href = "{naver_map_url}";
+                            </script>
+                            """, height=0)
+                            
+                            st.success(f"🗺️ {dest_name} 길찾기를 시작합니다...")
+                    elif approval_status == "rejected":
+                        st.markdown("""
+                        <div style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); 
+                                    color: white; 
+                                    padding: 2rem 1rem; 
+                                    border-radius: 10px; 
+                                    text-align: center;
+                                    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
+                                    height: 100%;">
+                            <h3 style="margin: 0; font-size: 1.5rem;">❌ 거절됨</h3>
+                            <p style="margin: 0.5rem 0 0 0; font-size: 0.9rem;">병원 거절</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # 승인 상태가 없는 경우 (초기 상태)
+                        st.info("대기중")
             
             st.markdown("---")
 
@@ -656,32 +1098,74 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
         data=[{"lat": user_lat, "lon": user_lon, "color": [37, 99, 235]}],
         get_position="[lon, lat]",
         get_fill_color="color",
-        get_radius=100,
+        get_radius=50,  # 크기 줄임
         pickable=False
+    )
+    
+    # 사용자 위치 텍스트 레이어
+    user_text_layer = pdk.Layer(
+        "TextLayer",
+        data=[{"lat": user_lat, "lon": user_lon, "text": "현위치", "bg": [37, 99, 235, 220]}],
+        get_position="[lon, lat]",
+        get_text="text",
+        get_size=20,
+        get_color=[255, 255, 255],  # 흰색 텍스트
+        get_angle=0,
+        get_text_anchor='"middle"',
+        get_alignment_baseline='"bottom"',
+        get_pixel_offset=[0, -30],
+        background=True,
+        get_background_color="bg",
+        background_padding=[10, 6, 10, 6]
     )
     
     # 병원 마커 & 경로선 데이터
     marker_data = []
     path_data = []  # 실제 도로 경로용
+    text_data = []  # 텍스트 레이블용
     
     for idx, (row_idx, r) in enumerate(top3.iterrows()):
         try:
             h_lat = float(r["wgs84Lat"])
             h_lon = float(r["wgs84Lon"])
-            color = rank_colors[idx] if idx < 3 else [100, 100, 100]
+            meets_cond = r.get("_meets_conditions", False)
+            
+            # 조건 미달 시 회색, 조건 만족 시 순위별 색상
+            if meets_cond:
+                color = rank_colors[idx] if idx < 3 else [100, 100, 100]
+            else:
+                color = [156, 163, 175]  # 회색
             
             # 병원 마커
             eta = r.get("eta_minutes", 0)
             eta_text = f"약 {eta}분" if eta else "계산 중"
+            hospital_name = r.get("dutyName", "")
+            
             marker_data.append({
                 "lat": h_lat,
                 "lon": h_lon,
-                "name": r.get("dutyName"),
+                "name": hospital_name,
                 "addr": r.get("dutyAddr"),
                 "dist": r.get("distance_km"),
                 "eta": eta_text,
                 "color": color,
                 "rank": idx + 1
+            })
+            
+            # 병원 이름 텍스트 레이블
+            if meets_cond:
+                rank_emoji = ["🥇", "🥈", "🥉"][idx]
+                label_text = f"{hospital_name[:10]}"  # 이름 길이 제한
+                text_bg_color = color + [220]
+            else:
+                label_text = f"{hospital_name[:10]}"
+                text_bg_color = [156, 163, 175, 220]  # 회색
+            
+            text_data.append({
+                "lat": h_lat,
+                "lon": h_lon,
+                "text": label_text,
+                "bg": text_bg_color
             })
             
             # 실제 경로가 있으면 사용, 없으면 직선
@@ -724,8 +1208,25 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
         data=marker_data,
         get_position="[lon, lat]",
         get_fill_color="color",
-        get_radius=120,
+        get_radius=60,  # 크기 줄임
         pickable=True
+    )
+    
+    # 병원 이름 텍스트 레이어
+    hospital_text_layer = pdk.Layer(
+        "TextLayer",
+        data=text_data,
+        get_position="[lon, lat]",
+        get_text="text",
+        get_size=18,
+        get_color=[255, 255, 255],  # 흰색 텍스트
+        get_angle=0,
+        get_text_anchor='"middle"',
+        get_alignment_baseline='"bottom"',
+        get_pixel_offset=[0, -30],
+        background=True,
+        get_background_color="bg",  # 각 병원별 색상 배경
+        background_padding=[10, 6, 10, 6]
     )
     
     tooltip = {
@@ -749,18 +1250,20 @@ if st.button("지금 내 위치 기준 추천 3곳 보기", type="primary", use_
             zoom=11.5,
             pitch=0
         ),
-        layers=[path_layer, user_layer, hospital_layer],  # 실제 도로 경로 표시
+        layers=[path_layer, user_layer, hospital_layer, user_text_layer, hospital_text_layer],  # 텍스트 레이어 추가
         tooltip=tooltip
     ))
     
     # 범례
     st.markdown("""
-    <div style="display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.9rem;">
+    <div style="display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.9rem; flex-wrap: wrap;">
         <span>🔵 내 위치</span>
-        <span style="color: #dc2626;">🔴 1위</span>
-        <span style="color: #ea580c;">🟠 2위</span>
-        <span style="color: #facc15;">🟡 3위</span>
+        <span style="color: #dc2626;">🔴 1위 (조건 만족)</span>
+        <span style="color: #ea580c;">🟠 2위 (조건 만족)</span>
+        <span style="color: #facc15;">🟡 3위 (조건 만족)</span>
+        <span style="color: #9ca3af;">⚪ 필수 병상 없음</span>
     </div>
     """, unsafe_allow_html=True)
     
     st.success("조회 완료!")
+
