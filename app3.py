@@ -435,7 +435,7 @@ if st.session_state.stt_result:
 
 st.divider()
 
-st.subheader("🩺 환자 증상 선택")
+st.subheader("🩺 응급 구조 중증 질환 선택")
 symptom = st.selectbox("지금 환자에게 가장 가까운 카테고리를 고르세요", list(SYMPTOM_RULES.keys()), index=0)
 
 # 선택한 증상에 필요한 병상/장비 표시
