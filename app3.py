@@ -834,7 +834,7 @@ if st.session_state.show_results:
                 if tel and str(tel).strip() not in ("없음", "None", "nan", ""):
                     tel_clean = str(tel).strip()
                     # 발표용: 실제 연결은 010-2994-5413으로
-                    demo_phone = "010-2994-5413"
+                    demo_phone = "01029945413"
                     st.markdown(f"""
                     <a href="tel:{demo_phone}" style="text-decoration: none;">
                         <button style="
